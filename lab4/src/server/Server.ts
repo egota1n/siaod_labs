@@ -6,27 +6,36 @@ import { LogootDocument } from "../state/LogootDocument";
 import { LogootAtom } from "../state/LogootAtom";
 import { Position } from "../state/Position";
 import { VectorClock } from "../state/VectorClock";
+import { BroadcastQueue } from "./BroadcastQueue";
 
 /**
  * Абстрактный Server — синхронизация и stash-логика.
- * Примечание: методы run(), breakIfTermination(), getLogootDoc(), getSiteId(), setTerminated()
- * должны быть реализованы в дочерних классах (InsertionServer, DeletionServer и т.д.).
  */
 export abstract class Server {
     public static readonly REPLICAS_CNT = 3;
     public stashedOperations: Operation[] = [];
 
+    // Добавляем поддержку BroadcastQueue
+    protected broadcastQueue?: BroadcastQueue;
+
+    /** -------------------- Методы для BroadcastQueue -------------------- */
+    public setBroadcastQueue(queue: BroadcastQueue) {
+        this.broadcastQueue = queue;
+    }
+
+    protected async sendMessage(message: string, siteId: string) {
+        if (!this.broadcastQueue) throw new Error("BroadcastQueue not set!");
+        await this.broadcastQueue.addMessage(message, siteId);
+    }
+
+    /** -------------------- Абстрактные методы -------------------- */
     abstract run(): Promise<LogootDocument> | LogootDocument;
     abstract breakIfTermination(lastMessages: string[]): Promise<boolean> | boolean;
     abstract getLogootDoc(): LogootDocument;
     abstract getSiteId(): string;
     abstract setTerminated(siteId: string): void;
 
-    /**
-     * Популярный цикл: для каждого JSON-сообщения пытаемся десериализовать операцию,
-     * пропускаем свои операции, stash'им неподходящие, применяем остальные и пытаемся
-     * ре-апплаить stash'енные операции.
-     */
+    /** -------------------- Синхронизация -------------------- */
     synchronize(lastMessages: string[]) {
         for (const message of lastMessages) {
             if (!message) continue;
@@ -39,7 +48,6 @@ export abstract class Server {
                 continue;
             }
 
-            // termination handling
             if (json.TYPE === "termination") {
                 if (json.siteId && json.siteId !== this.getSiteId()) {
                     this.setTerminated(json.siteId);
@@ -53,7 +61,6 @@ export abstract class Server {
                 continue;
             }
 
-            // не применяем операции, созданные самим собой
             if (operation.getSiteId && operation.getSiteId() === this.getSiteId()) {
                 continue;
             }
@@ -65,12 +72,10 @@ export abstract class Server {
 
             operation.apply(this.getLogootDoc());
 
-            // попробуем применить stash'енные операции, пока есть изменения
             let stashImpact = true;
             while (stashImpact) {
                 const indicesToRemove = this.tryApplyStashedOperations();
                 if (indicesToRemove.length === 0) stashImpact = false;
-                // удаляем применённые операции из stash (сохраняем порядок остальных)
                 this.stashedOperations = this.stashedOperations.filter((_, idx) => !indicesToRemove.includes(idx));
             }
         }
@@ -102,8 +107,7 @@ export abstract class Server {
         return successful;
     }
 
-    /** -------------------- Вспомогательные методы десериализации -------------------- */
-
+    /** -------------------- Десериализация -------------------- */
     private deserializeOperation(json: any): Operation | null {
         const type = json.TYPE;
         if (type === "insert") {
@@ -116,16 +120,12 @@ export abstract class Server {
         }
         if (type === "replace") {
             const atom = this.reconstructAtom(json.atom);
-            // ReplaceOperation(oldVal: string, atom, siteId) — у тебя в Java конструктор был (atom, oldVal, siteId)
-            // В TS у меня примерный конструктор: new ReplaceOperation(atom, oldVal, siteId)
             return new ReplaceOperation(atom, json.oldVal ?? json.oldValue ?? json.old, json.siteId);
         }
         return null;
     }
 
     private reconstructAtom(a: any): LogootAtom {
-        // ожидается структура:
-        // { position: { digits: number[], siteId: string, clock: { ... } }, value: string, _isDeleted?: boolean }
         const pos = this.reconstructPosition(a.position);
         const value = a.value ?? a.val ?? "";
         const isDeleted = !!(a._isDeleted || a.isDeleted || a.deleted);
@@ -133,7 +133,6 @@ export abstract class Server {
     }
 
     private reconstructPosition(p: any): Position {
-        // ожидается p.digits: number[], p.siteId: string, p.clock: object
         const digits: number[] = Array.isArray(p.digits) ? p.digits : [];
         const siteId: string = p.siteId ?? p.site ?? "";
         const clock = this.reconstructVectorClock(p.clock ?? p.timestamp ?? p.vc ?? {});
@@ -141,10 +140,8 @@ export abstract class Server {
     }
 
     private reconstructVectorClock(vcObj: any): VectorClock {
-        // vcObj может быть как объект { "<siteId>": number, ... } или { clock: { "<siteId>": number, ... } }
         const payload = vcObj?.clock ?? vcObj ?? {};
         const vc = new VectorClock();
-        // payload может быть Map-like or object
         if (typeof payload === "object") {
             for (const k of Object.keys(payload)) {
                 const v = Number((payload as any)[k]);
